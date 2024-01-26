@@ -28,8 +28,8 @@ gradio cc docs
 
 The `gradio cc docs` command will generate an interactive Gradio app and a static README file with various features. You can see an example here:
 
-- [Gradio app deployed on Hugging Face Spaces]()
-- [README.md rendered by GitHub]()
+- [Gradio app deployed on Hugging Face Spaces](https://huggingface.co/spaces/freddyaboulton/gradio_pdf)
+- [README.md rendered by GitHub](https://github.com/freddyaboulton/gradio-pdf/blob/main/README.md)
 
 The README.md and space both have the following features:
 
