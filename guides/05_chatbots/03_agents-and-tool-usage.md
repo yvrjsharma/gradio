@@ -367,60 +367,93 @@ client = anthropic.Anthropic()
 First, let's set up our message formatting functions that handle document preparation:
 
 ```python
-def encode_pdf_to_base64(file_obj) -> str:
-    """Convert uploaded PDF file to base64 string."""
-    if file_obj is None:
-        return None
-    with open(file_obj.name, 'rb') as f:
-        return base64.b64encode(f.read()).decode('utf-8')
+def read_pdf_as_base64(file_path: str) -> str:
+    """Read a PDF file and return its base64 encoded content."""
+    with open(file_path, 'rb') as file:
+        return base64.b64encode(file.read()).decode('utf-8')
 
 def format_message_history(
-    history: list, 
+    history: list,
     enable_citations: bool,
     doc_type: str,
-    text_input: str,
-    pdf_file: str
+    text_content: str,
+    pdf_files: str
 ) -> List[Dict]:
     """Convert Gradio chat history to Anthropic message format."""
     formatted_messages = []
-    
+
     # Add previous messages
     for msg in history[:-1]:
         if msg["role"] == "user":
-            formatted_messages.append({"role": "user", "content": msg["content"]})
-    
-    # Prepare the latest message with document
+            formatted_messages.append({
+                "role": "user",
+                "content": msg["content"]
+            })
+        elif msg["role"] == "assistant":
+            if "metadata" not in msg or msg["metadata"] is None:
+                formatted_messages.append({
+                    "role": "assistant",
+                    "content": msg["content"]
+                })
+
+    # Prepare the latest message
     latest_message = {"role": "user", "content": []}
-    
+
+    # Add documents if citations are enabled
     if enable_citations:
-        if doc_type == "plain_text":
+        # Handle plain text input
+        if doc_type in ["plain_text", "combined"] and text_content.strip():
             latest_message["content"].append({
                 "type": "document",
                 "source": {
                     "type": "text",
                     "media_type": "text/plain",
-                    "data": text_input.strip()
+                    "data": text_content.strip()
                 },
-                "title": "Text Document",
+                "title": "User Text Document",
                 "citations": {"enabled": True}
             })
-        elif doc_type == "pdf" and pdf_file:
-            pdf_data = encode_pdf_to_base64(pdf_file)
-            if pdf_data:
-                latest_message["content"].append({
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": pdf_data
-                    },
-                    "title": pdf_file.name,
-                    "citations": {"enabled": True}
-                })
-    
+
+        # Handle PDF input
+        if doc_type in ["pdf", "combined"] and pdf_files:
+            # Handle pdf_files as a list
+            if isinstance(pdf_files, str):
+                pdf_files = [pdf_files]  # Convert single path to list
+            
+            # Add each PDF as a separate document
+            for i, pdf_file in enumerate(pdf_files):
+                try:
+                    pdf_base64 = read_pdf_as_base64(pdf_file)
+                    latest_message["content"].append({
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_base64
+                        },
+                        "title": f"User PDF Document {i+1}",
+                        "citations": {"enabled": True}
+                    })
+                except Exception as e:
+                    continue
+
+        # If no documents were added and citations are enabled, use default document
+        if not latest_message["content"]:
+            latest_message["content"].append({
+                "type": "document",
+                "source": {
+                    "type": "text",
+                    "media_type": "text/plain",
+                    "data": DEFAULT_DOC
+                },
+                "title": "Sample Document",
+                "citations": {"enabled": True}
+            })
+
     # Add the user's question
-    latest_message["content"].append({"type": "text", "text": history[-1]["content"]})
-    
+    latest_message["content"].append({"type": "text", "text": history[-1]["content"]
+    })
+
     formatted_messages.append(latest_message)
     return formatted_messages
 ```
@@ -432,17 +465,33 @@ def bot_response(
     history: list,
     enable_citations: bool,
     doc_type: str,
-    text_input: str,
-    pdf_file: str
+    text_content: str,
+    pdf_file: str,
+    api_key: str
 ) -> List[Dict[str, Any]]:
     try:
-        messages = format_message_history(history, enable_citations, doc_type, text_input, pdf_file)
-        response = client.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=1024, messages=messages)
-        
+        if not api_key:
+            history.append({
+                "role": "assistant",
+                "content": "Please provide your Anthropic API key to continue."
+            })
+            return history
+
+        # Initialize client with provided API key
+        client = anthropic.Anthropic(api_key=api_key)
+
+        messages = format_message_history(history, enable_citations, doc_type, text_content, pdf_file)
+
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1024,
+            messages=messages
+        )
+
         # Initialize main response and citations
         main_response = ""
         citations = []
-        
+
         # Process each content block
         for block in response.content:
             if block.type == "text":
@@ -451,53 +500,106 @@ def bot_response(
                     for citation in block.citations:
                         if citation.cited_text not in citations:
                             citations.append(citation.cited_text)
-        
+
         # Add main response
-        history.append({"role": "assistant", "content": main_response})
-        
-        # Add citations in a collapsible section
+        history.append({
+            "role": "assistant",
+            "content": main_response
+        })
+
+        # Add citations if any were found and citations are enabled
         if enable_citations and citations:
             history.append({
                 "role": "assistant",
                 "content": "\n".join([f"• {cite}" for cite in citations]),
                 "metadata": {"title": "📚 Citations"}
             })
-        
-        return history
-            
-    except Exception as e:
-        history.append({
-            "role": "assistant",
-            "content": "I apologize, but I encountered an error while processing your request."
-        })
+
         return history
 ```
 
 Finally, let's create the Gradio interface:
 
 ```python
-with gr.Blocks() as demo:
-    gr.Markdown("# Chat with Citations")
-    
+with gr.Blocks(theme="ocean", fill_height=True) as demo:
+    gr.Markdown("# Chat with Anthropic Claude's Citations")
+
     with gr.Row(scale=1):
         with gr.Column(scale=4):
-            chatbot = gr.Chatbot(type="messages", bubble_full_width=False, show_label=False, scale=1)
-            msg = gr.Textbox(placeholder="Enter your message here...", show_label=False, container=False)
-            
+            chatbot = gr.Chatbot(
+                type="messages",
+                bubble_full_width=False,
+                show_label=False,
+                scale=1
+            )
+
+            msg = gr.Textbox(
+                placeholder="Enter your message here...",
+                show_label=False,
+                container=False
+            )
+
         with gr.Column(scale=1):
-            enable_citations = gr.Checkbox(label="Enable Citations", value=True, info="Toggle citation functionality" )
-            doc_type_radio = gr.Radio( choices=["plain_text", "pdf"], value="plain_text", label="Document Type", info="Choose the type of document to use")
-            text_input = gr.Textbox(label="Document Content", lines=10, info="Enter the text you want to reference")
-            pdf_input = gr.File(label="Upload PDF", file_types=[".pdf"], file_count="single", visible=False)
-    
+            api_key = gr.Textbox(
+                type="password",
+                label="Anthropic API Key",
+                placeholder="Enter your API key",
+                info="Your API key will not be stored",
+                interactive=True,
+            )
+
+            enable_citations = gr.Checkbox(
+                label="Enable Citations",
+                value=True,
+                info="Toggle citation functionality"
+            )
+
+            doc_type_radio = gr.Radio(
+                choices=["plain_text", "pdf", "combined"],
+                value="plain_text",
+                label="Document Type",
+                info="Choose the type of document(s) to reference"
+            )
+
+            text_input = gr.Textbox(
+                label="Document Content",
+                placeholder="Enter your document text here...",
+                lines=10,
+                info="Enter the text you want to reference"
+            )
+
+            pdf_input = gr.File(
+                label="Upload PDF",
+                file_count="multiple",
+                file_types=[".pdf"],
+                type="filepath",
+                visible=False
+            )
+
+    clear = gr.ClearButton([msg, chatbot, text_input, pdf_input])
+
+    # Update input visibility based on settings
+    enable_citations.change(
+        update_document_inputs,
+        inputs=[enable_citations, doc_type_radio],
+        outputs=[doc_type_radio, text_input, pdf_input]
+    )
+
+    doc_type_radio.change(
+        update_document_inputs,
+        inputs=[enable_citations, doc_type_radio],
+        outputs=[doc_type_radio, text_input, pdf_input]
+    )
+
     # Handle message submission
     msg.submit(
         user_message,
-        [msg, chatbot, enable_citations, doc_type_radio, text_input, pdf_input],
-        [msg, chatbot]
+        [msg, chatbot, enable_citations, doc_type_radio, text_input, pdf_input, api_key],
+        [msg, chatbot],
+        queue=False
     ).then(
         bot_response,
-        [chatbot, enable_citations, doc_type_radio, text_input, pdf_input],
+        [chatbot, enable_citations, doc_type_radio, text_input, pdf_input, api_key],
         chatbot
     )
 
@@ -505,7 +607,7 @@ demo.launch()
 ```
 
 This creates a chatbot that:
-- Supports both plain text and PDF documents for Claude to cite from 
+- Supports both plain text and multiple PDF documents for Claude to cite from 
 - Displays Citations in collapsible sections using our `metadata` feature
 - Shows source quotes directly from the given documents
 
